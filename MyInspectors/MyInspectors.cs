@@ -62,24 +62,40 @@ namespace MyInspectors
                 }
                 return true;
             }
-            [HarmonyPatch("OnAttach")]
+                [HarmonyPatch("OnAttach")]
             [HarmonyPostfix]
             public static void OnAttachPostfix(SceneInspector __instance)
             {
-                if (!__instance.World.IsAuthority) __instance.ComponentView.OnTargetChange += slotCallback;
+                if (__instance.World.IsAuthority) return;
+                __instance.ComponentView.OnTargetChange += slotCallback;
+                __instance.Root.OnTargetChange += slotCallback;
             }
 
+            [HarmonyPatch("OnChanges")]
+            [HarmonyPostfix]
+            public static void OnChangesPostfix(SceneInspector __instance, SyncRef<Slot> ____currentRoot, SyncRef<Slot> ____hierarchyContentRoot, SyncRef<Sync<string>> ____rootText, SyncRef<Slot> ____currentComponent)
+            {
+                if (____currentRoot.Target != __instance.Root.Target && __instance.Root.IsSyncDirty)
+                {
+                    ____currentRoot.Target = __instance.Root.Target;
+                    ____hierarchyContentRoot.Target.DestroyChildren();
+                    ____rootText.Target.Value = "Root: " + (____currentRoot.Target?.Name ?? "<i>null</i>");
+                    if (____currentRoot.Target != null)
+                    {
+                        ____hierarchyContentRoot.Target.AddSlot("HierarchyRoot").AttachComponent<SlotInspector>().Setup(____currentRoot.Target, ____currentComponent);
+                    }
+                }
+            }
         }
         private static void slotCallback(SyncRef<Slot> s)
         {
             if (s.Target != null)
             {
                 var i = (SceneInspector)s.Parent;
-                i.ComponentView.OnTargetChange -= slotCallback;
+                s.OnTargetChange -= slotCallback;
                 Slot old = s.Target;
-                Msg(s.Target.Name);
-                i.RunInUpdates(0, () => i.ComponentView.Target = null);
-                i.RunInUpdates(2, () => i.ComponentView.Target = old);
+                i.RunInUpdates(0, () => s.Target = null);
+                i.RunInUpdates(2, () => s.Target = old);
             }
         }
 
