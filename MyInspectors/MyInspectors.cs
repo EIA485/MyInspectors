@@ -10,6 +10,7 @@ using FrooxEngine.LogiX;
 using BaseX;
 using System.Reflection.Emit;
 using FrooxEngine.UIX;
+using Microsoft.Win32;
 
 namespace MyInspectors
 {
@@ -40,10 +41,11 @@ namespace MyInspectors
         {
             public static void Postfix(object __instance)
             {
-                if(__instance is SceneInspector i)
+                if (__instance is SceneInspector i)
                 {
                     // onchanges triggers 1 update later, when we need 0 updates so it doesn't sync
-                    i.RunInUpdates(0, () => {
+                    i.RunInUpdates(0, () =>
+                    {
                         Traverse.Create(__instance).Method("OnChanges").GetValue();
                     });
                 }
@@ -81,7 +83,7 @@ namespace MyInspectors
 
             public static void ResetContainer(WorkerInspector i)
             {
-                if(!i.World.IsAuthority)
+                if (!i.World.IsAuthority)
                     (_targetContainer.GetValue(i) as SyncRef<Worker>).Target = null;
             }
             public static bool IsHost(SceneInspector i)
@@ -135,93 +137,125 @@ namespace MyInspectors
             }
         }
 
-        static bool IsAlocatingUser(IWorldElement element) => element.ReferenceID.User == element.World.LocalUser.AllocationID;
-
-        [HarmonyPatch]
-        class Transpiler_AlocatingUser
+        static bool IsAlocatingUser(IWorldElement element)
         {
-            static IEnumerable<MethodBase> TargetMethods()
+            return element.ReferenceID.User == element.World.LocalUser.AllocationID;
+        }
+        static IEnumerable<CodeInstruction> GenericOnChanges_Transpiler(IEnumerable<CodeInstruction> codes, Type PatchClass)
+        {
+            int hit = 0;
+            foreach (var code in codes)
             {
-                yield return AccessTools.Method(typeof(SlotInspector), "OnChanges");
-                yield return AccessTools.Method(typeof(UserInspectorItem), "OnChanges");
-                yield return AccessTools.Method(typeof(BagEditor), "OnChanges");
-                yield return AccessTools.Method(typeof(ListEditor), "OnChanges");
-            }
-            static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> codes)
-            {
-                int hit = 0;
-                foreach (var code in codes)
+                if (hit <= 0 && (code.operand as MethodInfo)?.Name == "get_World")
                 {
-                    if (hit <= 0 && (code.operand as MethodInfo)?.Name == "get_World")
-                    {
-                        hit++;
-                        code.operand = AccessTools.Method(typeof(MyInspectors), nameof(IsAlocatingUser));
-                        yield return code;
-                    }
-                    else if (hit == 1)
-                    {
-                        hit++;
-                        yield return new(OpCodes.Nop);
-                    }
-                    else
-                    {
-                        yield return code;
-                    }
+                    hit++;
+                    code.operand = AccessTools.Method(PatchClass, "ShouldUpdate");
+                    yield return code;
+                }
+                else if (hit == 1)
+                {
+                    hit++;
+                    yield return new(OpCodes.Nop);
+                }
+                else
+                {
+                    yield return code;
                 }
             }
         }
 
-        [HarmonyPatch(typeof(SlotInspector), nameof(SlotInspector.Setup))]
+        [HarmonyPatch(typeof(SlotInspector))]
         class SlotInspector_Patch
         {
-            static bool Prefix(SlotInspector __instance, Slot target, SyncRef<Slot> selectionReference, int depth, RelayRef<SyncRef<Slot>> ____selectionReference, Sync<int> ____depth, SyncRef<Slot> ____rootSlot)
+            static Dictionary<SlotInspector, Slot> Registerd = new();
+
+            [HarmonyPrefix]
+            [HarmonyPatch(nameof(SlotInspector.Setup))]
+            static bool Setup_Prefix(SlotInspector __instance, Slot target, SyncRef<Slot> selectionReference, int depth, RelayRef<SyncRef<Slot>> ____selectionReference, Sync<int> ____depth, SyncRef<Slot> ____rootSlot)
             {
                 if (__instance.World.IsAuthority) return true;
                 ____selectionReference.Target = selectionReference;
                 ____depth.Value = depth;
                 slot_target.SetValue(____rootSlot, target); //i think there is some proper way to set a local value but i forget it.
-
+                Registerd.Add(__instance, target);
+                __instance.Disposing += (instance) => Registerd.Remove((SlotInspector)instance); // using the var from the event so this is a compile time function not a runtime delegate
                 OnChanges.Invoke(__instance, null);
                 return false;
             }
+
+            [HarmonyTranspiler]
+            [HarmonyPatch("OnChanges")]
+            static IEnumerable<CodeInstruction> OnChanges_Transpiler(IEnumerable<CodeInstruction> codes) => GenericOnChanges_Transpiler(codes, typeof(SlotInspector_Patch));
         }
 
-        [HarmonyPatch(typeof(UserInspectorItem), nameof(UserInspectorItem.Setup))]
+        [HarmonyPatch(typeof(UserInspectorItem))]
         class UserInspectorItem_Patch
         {
-            static bool Prefix(UserInspectorItem __instance, User user, SyncRef<User> ____user)
+            static Dictionary<UserInspectorItem, User> Registerd = new();
+
+            [HarmonyPrefix]
+            [HarmonyPatch(nameof(UserInspectorItem.Setup))]
+            static bool Setup_Prefix(UserInspectorItem __instance, User user, SyncRef<User> ____user)
             {
                 if (__instance.World.IsAuthority) return true;
                 user_target.SetValue(____user, user);
+                Registerd.Add(__instance, user);
+                __instance.Disposing += (instance) => Registerd.Remove((UserInspectorItem)instance);
                 return false;
             }
+
+            [HarmonyTranspiler]
+            [HarmonyPatch("OnChanges")]
+            static IEnumerable<CodeInstruction> OnChanges_Transpiler(IEnumerable<CodeInstruction> codes) => GenericOnChanges_Transpiler(codes, typeof(UserInspectorItem_Patch));
         }
         //these 2 could have some extra stuff done so they work after being loaded from a non local save. its not really worth it imo but something worth noting
         //from looking into it some good options are FrooxEngine.MaterialRelay.MaterialRefs and comp slot bag 
-        [HarmonyPatch(typeof(BagEditor), nameof(BagEditor.Setup))]
+        [HarmonyPatch(typeof(BagEditor))]
         class BagEditor_Patch
         {
-            static bool Prefix(BagEditor __instance, ISyncBag target, Button button, SyncRef<ISyncBag> ____targetBag, SyncRef<Button> ____addNewButton)
+            static Dictionary<BagEditor, ISyncBag> Registerd = new();
+
+
+            [HarmonyPrefix]
+            [HarmonyPatch(nameof(BagEditor.Setup))]
+            static bool Setup_Prefix(BagEditor __instance, ISyncBag target, Button button, SyncRef<ISyncBag> ____targetBag, SyncRef<Button> ____addNewButton)
             {
                 if (__instance.World.IsAuthority) return true;
                 ____addNewButton.Target = button;
                 syncBag_target.SetValue(____targetBag, target);
+                Registerd.Add(__instance, target);
+                __instance.Disposing += (instance) => Registerd.Remove((BagEditor)instance);
                 button.Pressed.Target = BagEditorAddNewPressed.CreateDelegate(typeof(ButtonEventHandler), __instance) as ButtonEventHandler;
                 return false;
             }
+
+            [HarmonyTranspiler]
+            [HarmonyPatch("OnChanges")]
+            static IEnumerable<CodeInstruction> OnChanges_Transpiler(IEnumerable<CodeInstruction> codes) => GenericOnChanges_Transpiler(codes, typeof(BagEditor_Patch));
         }
 
-        [HarmonyPatch(typeof(ListEditor), nameof(ListEditor.Setup))]
+        [HarmonyPatch(typeof(ListEditor))]
         class ListEditor_Patch
         {
-            static bool Prefix(ListEditor __instance, ISyncList target, Button button, SyncRef<ISyncList> ____targetList, SyncRef<Button> ____addNewButton)
+            static Dictionary<ListEditor, ISyncList> Registerd = new();
+
+
+            [HarmonyPrefix]
+            [HarmonyPatch(nameof(ListEditor.Setup))]
+            static bool Setup_Prefix(ListEditor __instance, ISyncList target, Button button, SyncRef<ISyncList> ____targetList, SyncRef<Button> ____addNewButton)
             {
                 if (__instance.World.IsAuthority) return true;
                 ____addNewButton.Target = button;
                 synclist_target.SetValue(____targetList, target);
+                Registerd.Add(__instance, target);
+                __instance.Disposing += (instance) => Registerd.Remove((ListEditor)instance);
                 button.Pressed.Target = ListEditorAddNewPressed.CreateDelegate(typeof(ButtonEventHandler), __instance) as ButtonEventHandler;
                 return false;
             }
+
+            [HarmonyTranspiler]
+            [HarmonyPatch("OnChanges")]
+            static IEnumerable<CodeInstruction> OnChanges_Transpiler(IEnumerable<CodeInstruction> codes) => GenericOnChanges_Transpiler(codes, typeof(ListEditor_Patch));
         }
     }
 }
